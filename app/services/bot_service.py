@@ -3,20 +3,23 @@ Motor del bot: máquina de estados que procesa cada mensaje entrante
 y devuelve la respuesta correspondiente según el estado actual del usuario.
 
 Estados:
-  NUEVO            → primer contacto, pedir tipo de usuario
-  MENU             → menú principal
-  VIENDO_CARGAS    → flujo CU-02
-  PV_ORIGEN        → flujo CU-03, paso origen
-  PV_DESTINO       → paso destino
-  PV_TIPO_CAMION   → paso tipo de camión
-  PV_FECHA_SALIDA  → paso fecha salida
-  PV_FECHA_VUELTA  → paso fecha vuelta
-  PV_CONFIRMAR     → confirmación final
+  NUEVO                → primer contacto, pedir tipo de usuario
+  MENU                 → menú principal
+  vc_listado           → viendo listado de cargas (todas)
+  vc_filtro_origen     → el usuario eligió filtrar por su ubicación
+  PV_ORIGEN            → flujo CU-03, paso origen
+  PV_DESTINO           → paso destino
+  PV_TIPO_CAMION       → paso tipo de camión (1/2/3)
+  pv_tipo_camion_manual→ el usuario eligió "Otro", escribe libremente
+  PV_FECHA_SALIDA      → paso fecha salida (formato dd/mm)
+  PV_FECHA_VUELTA      → paso fecha vuelta (formato dd/mm o "-")
+  PV_CONFIRMAR         → confirmación final
 """
 
+import re
 from sqlalchemy.orm import Session
 from app.models.models import Usuario, Carga, Viaje, EstadoBot, TipoUsuario
-from app.services.matching_service import buscar_cargas_compatibles
+from app.services.matching_service import buscar_cargas_compatibles, buscar_todas_las_cargas
 
 
 # ──────────────────────────────────────────────
@@ -38,12 +41,30 @@ MSG_EMPRESA = (
 )
 
 MSG_MENU = (
-    "Estas son las opciones disponibles:\n\n"
+    "¿Qué querés hacer?\n\n"
     "1️⃣ Ver cargas disponibles\n"
     "2️⃣ Publicar viaje"
 )
 
 MSG_OPCION_INVALIDA = "No entendí tu respuesta. Por favor elegí una opción válida."
+
+MSG_FORMATO_FECHA = (
+    "⚠️ Formato de fecha inválido.\n"
+    "Usá el formato *dd/mm*, por ejemplo: *15/06*"
+)
+
+
+# ──────────────────────────────────────────────
+# Validación de fechas
+# ──────────────────────────────────────────────
+
+def _es_fecha_valida(texto: str) -> bool:
+    """Valida que el texto sea dd/mm con valores razonables."""
+    patron = r"^\d{2}/\d{2}$"
+    if not re.match(patron, texto.strip()):
+        return False
+    dia, mes = texto.strip().split("/")
+    return 1 <= int(dia) <= 31 and 1 <= int(mes) <= 12
 
 
 # ──────────────────────────────────────────────
@@ -63,32 +84,29 @@ def procesar_mensaje(telefono: str, texto: str, db: Session) -> str:
 
     estado = usuario.estado_bot
 
-    # ── NUEVO: primer contacto ──────────────────
     if estado == EstadoBot.NUEVO:
         return _manejar_nuevo(usuario, texto, db)
 
-    # ── MENÚ PRINCIPAL ─────────────────────────
     if estado == EstadoBot.MENU:
         return _manejar_menu(usuario, texto, db)
 
-    # ── VER CARGAS (CU-02) ─────────────────────
-    if estado == EstadoBot.VIENDO_CARGAS:
+    if estado in (EstadoBot.VIENDO_CARGAS, "vc_listado", "vc_filtro_origen"):
         return _manejar_ver_cargas(usuario, texto, db)
 
-    # ── PUBLICAR VIAJE (CU-03) ─────────────────
     if estado in (
         EstadoBot.PV_ORIGEN,
         EstadoBot.PV_DESTINO,
         EstadoBot.PV_TIPO_CAMION,
+        "pv_tipo_camion_manual",
         EstadoBot.PV_FECHA_SALIDA,
         EstadoBot.PV_FECHA_VUELTA,
         EstadoBot.PV_CONFIRMAR,
     ):
         return _manejar_publicar_viaje(usuario, texto, db)
 
-    # Fallback
+    # Fallback: resetear al menú
     _set_estado(usuario, EstadoBot.MENU, db)
-    return MSG_MENU
+    return f"Volvemos al inicio 🔄\n\n{MSG_MENU}"
 
 
 # ──────────────────────────────────────────────
@@ -108,7 +126,8 @@ def _manejar_nuevo(usuario: Usuario, texto: str, db: Session) -> str:
 
 def _manejar_menu(usuario: Usuario, texto: str, db: Session) -> str:
     if texto == "1":
-        return _iniciar_ver_cargas(usuario, db)
+        # MEJORA 1: mostrar TODAS las cargas primero, sin filtros
+        return _mostrar_todas_las_cargas(usuario, db)
     elif texto == "2":
         _set_estado(usuario, EstadoBot.PV_ORIGEN, db)
         return "¿De dónde salís? ✍️\nEjemplo: Neuquén, Rosario, Buenos Aires..."
@@ -116,36 +135,54 @@ def _manejar_menu(usuario: Usuario, texto: str, db: Session) -> str:
         return f"{MSG_OPCION_INVALIDA}\n\n{MSG_MENU}"
 
 
-def _iniciar_ver_cargas(usuario: Usuario, db: Session) -> str:
-    # Si no tiene preferencias, las pedimos
-    if not usuario.preferencia_origen:
-        _set_estado(usuario, EstadoBot.VIENDO_CARGAS, db)
-        return "Para mostrarte mejores cargas 🚛\n¿Desde dónde solés trabajar?\nEjemplo: Neuquén"
-    # Ya tiene preferencias → mostrar cargas directamente
-    return _mostrar_cargas(usuario, db)
+def _mostrar_todas_las_cargas(usuario: Usuario, db: Session) -> str:
+    """Muestra todas las cargas activas sin filtro de ubicación."""
+    cargas = buscar_todas_las_cargas(db)
+    _set_estado(usuario, "vc_listado", db)
+
+    if not cargas:
+        _set_estado(usuario, EstadoBot.MENU, db)
+        return (
+            "No hay cargas disponibles en este momento 😕\n"
+            "Volvé a intentar más tarde.\n\n"
+            f"{MSG_MENU}"
+        )
+
+    lineas = ["🚛 *Cargas disponibles:*\n"]
+    for i, c in enumerate(cargas[:5], start=1):
+        lineas.append(f"{i}️⃣ {c.origen} → {c.destino}\n   {c.tipo_carga or 'Carga general'} | 📅 {c.fecha_retiro}")
+
+    lineas.append("\nEscribí el número para ver el detalle")
+    lineas.append("F - Filtrar por mi ubicación")
+    lineas.append("0 - Volver al menú")
+    return "\n".join(lineas)
 
 
 def _manejar_ver_cargas(usuario: Usuario, texto: str, db: Session) -> str:
-    # Capturar preferencias si faltan
-    if not usuario.preferencia_origen:
+    estado = usuario.estado_bot
+    texto_lower = texto.lower().strip()
+
+    # ── Esperando origen para filtrar ──
+    if estado == "vc_filtro_origen":
         usuario.preferencia_origen = texto.title()
         db.commit()
-        return "¿Hacia qué zonas te interesa viajar?\nEjemplo: Rosario, Buenos Aires..."
+        return _mostrar_cargas_filtradas(usuario, db)
 
-    if not usuario.preferencia_destino:
-        usuario.preferencia_destino = texto.title()
-        db.commit()
-        return _mostrar_cargas(usuario, db)
+    # ── Listado visible: procesar navegación ──
+    if texto_lower in ("0", "menu", "menú"):
+        _set_estado(usuario, EstadoBot.MENU, db)
+        return MSG_MENU
 
-    # Ya tiene preferencias — navegar listado
-    if texto == "0":
-        usuario.preferencia_origen = None
-        usuario.preferencia_destino = None
-        db.commit()
-        return "¿Desde dónde solés trabajar?\nEjemplo: Neuquén"
+    if texto_lower == "f":
+        _set_estado(usuario, "vc_filtro_origen", db)
+        return "📍 ¿Desde qué ciudad querés filtrar?\nEjemplo: Neuquén, Córdoba..."
 
     # Selección de carga por número
-    cargas = buscar_cargas_compatibles(usuario.preferencia_origen, usuario.preferencia_destino, db)
+    if usuario.preferencia_origen:
+        cargas = buscar_cargas_compatibles(usuario.preferencia_origen, None, db)
+    else:
+        cargas = buscar_todas_las_cargas(db)
+
     try:
         idx = int(texto) - 1
         if 0 <= idx < len(cargas):
@@ -153,38 +190,46 @@ def _manejar_ver_cargas(usuario: Usuario, texto: str, db: Session) -> str:
             _set_estado(usuario, EstadoBot.MENU, db)
             return (
                 f"📦 *Detalle de carga*\n\n"
-                f"Origen: {carga.origen}\n"
-                f"Destino: {carga.destino}\n"
-                f"Tipo: {carga.tipo_carga or 'No especificado'}\n"
-                f"Peso: {carga.peso_toneladas or '?'} tn\n"
-                f"Fecha: {carga.fecha_retiro}\n"
+                f"🔹 Origen: {carga.origen}\n"
+                f"🔹 Destino: {carga.destino}\n"
+                f"🔹 Tipo: {carga.tipo_carga or 'No especificado'}\n"
+                f"🔹 Peso: {carga.peso_toneladas or '?'} tn\n"
+                f"🔹 Fecha: {carga.fecha_retiro}\n"
                 f"📞 Contacto: {carga.contacto_telefono or 'No disponible'}\n\n"
                 f"1️⃣ Ver más cargas\n"
                 f"2️⃣ Volver al menú"
             )
-    except (ValueError, IndexError):
+        else:
+            raise ValueError
+    except (ValueError, TypeError):
         pass
 
-    return f"{MSG_OPCION_INVALIDA}\n\n{_mostrar_cargas(usuario, db)}"
+    # MEJORA 2: si no entiende, volver a mostrar el listado limpio (no bucle)
+    return _mostrar_todas_las_cargas(usuario, db)
 
 
-def _mostrar_cargas(usuario: Usuario, db: Session) -> str:
-    cargas = buscar_cargas_compatibles(usuario.preferencia_origen, usuario.preferencia_destino, db)
-    _set_estado(usuario, EstadoBot.VIENDO_CARGAS, db)
+def _mostrar_cargas_filtradas(usuario: Usuario, db: Session) -> str:
+    """Muestra cargas filtradas por origen del usuario."""
+    cargas = buscar_cargas_compatibles(usuario.preferencia_origen, None, db)
+    _set_estado(usuario, "vc_listado", db)
 
     if not cargas:
+        nombre_origen = usuario.preferencia_origen
+        usuario.preferencia_origen = None
+        db.commit()
+        _set_estado(usuario, EstadoBot.MENU, db)
         return (
-            "No hay cargas disponibles en este momento 😕\n"
-            "Te avisaremos cuando aparezcan en tu zona.\n\n"
+            f"No encontré cargas desde *{nombre_origen}* 😕\n"
+            "Podés ver todas las cargas disponibles desde el menú.\n\n"
             f"{MSG_MENU}"
         )
 
-    lineas = ["🚛 *Cargas disponibles cerca de vos:*\n"]
+    lineas = [f"🚛 *Cargas desde {usuario.preferencia_origen}:*\n"]
     for i, c in enumerate(cargas[:5], start=1):
-        lineas.append(f"{i}️⃣ {c.origen} → {c.destino}\n{c.tipo_carga or 'Carga general'} | {c.fecha_retiro}")
+        lineas.append(f"{i}️⃣ {c.origen} → {c.destino}\n   {c.tipo_carga or 'Carga general'} | 📅 {c.fecha_retiro}")
 
-    lineas.append("\nEscribí el número para ver detalles")
-    lineas.append("0️⃣ Cambiar ubicación")
+    lineas.append("\nEscribí el número para ver el detalle")
+    lineas.append("0 - Volver al menú")
     return "\n".join(lineas)
 
 
@@ -203,32 +248,70 @@ def _manejar_publicar_viaje(usuario: Usuario, texto: str, db: Session) -> str:
             "¿Qué tipo de camión tenés?\n\n"
             "1️⃣ Semi\n"
             "2️⃣ Chasis\n"
-            "3️⃣ Otro"
+            "3️⃣ Otro (escribir manualmente)"
         )
 
     if estado == EstadoBot.PV_TIPO_CAMION:
-        tipos = {"1": "Semi", "2": "Chasis", "3": "Otro"}
-        if texto not in tipos:
-            return f"{MSG_OPCION_INVALIDA}\n\n1️⃣ Semi\n2️⃣ Chasis\n3️⃣ Otro"
-        usuario.temp_tipo_camion = tipos[texto]
+        if texto == "1":
+            usuario.temp_tipo_camion = "Semi"
+            _set_estado(usuario, EstadoBot.PV_FECHA_SALIDA, db)
+            return _msg_pedir_fecha_salida()
+        elif texto == "2":
+            usuario.temp_tipo_camion = "Chasis"
+            _set_estado(usuario, EstadoBot.PV_FECHA_SALIDA, db)
+            return _msg_pedir_fecha_salida()
+        elif texto == "3":
+            # MEJORA 3: pedir que escriba manualmente el tipo
+            _set_estado(usuario, "pv_tipo_camion_manual", db)
+            return "✍️ Escribí el tipo de camión que tenés:\nEjemplo: Batea, Volcador, Furgón, Cisterna..."
+        else:
+            return (
+                f"{MSG_OPCION_INVALIDA}\n\n"
+                "¿Qué tipo de camión tenés?\n\n"
+                "1️⃣ Semi\n"
+                "2️⃣ Chasis\n"
+                "3️⃣ Otro (escribir manualmente)"
+            )
+
+    # MEJORA 3: capturar tipo manual
+    if estado == "pv_tipo_camion_manual":
+        if len(texto.strip()) < 2:
+            return "Por favor describí el tipo de camión (mínimo 2 caracteres)."
+        usuario.temp_tipo_camion = texto.strip().title()
         _set_estado(usuario, EstadoBot.PV_FECHA_SALIDA, db)
-        return "¿Cuándo salís? 📅\nEjemplo: mañana, 15/06, hoy"
+        return _msg_pedir_fecha_salida()
 
+    # MEJORA 4: validar formato de fecha de salida
     if estado == EstadoBot.PV_FECHA_SALIDA:
-        usuario.temp_fecha_salida = texto
+        if not _es_fecha_valida(texto):
+            return MSG_FORMATO_FECHA + "\n\n" + _msg_pedir_fecha_salida()
+        usuario.temp_fecha_salida = texto.strip()
         _set_estado(usuario, EstadoBot.PV_FECHA_VUELTA, db)
-        return "¿Tenés fecha estimada de vuelta? (opcional)\nEscribí la fecha o *no sé*"
+        return (
+            "¿Tenés fecha estimada de vuelta? 📅\n"
+            "Formato: *dd/mm* — Ejemplo: *20/06*\n"
+            "Si no sabés, escribí *-*"
+        )
 
+    # MEJORA 4: validar formato de fecha de vuelta
     if estado == EstadoBot.PV_FECHA_VUELTA:
-        usuario.temp_fecha_vuelta = texto if texto.lower() != "no sé" else None
+        if texto.strip() == "-":
+            usuario.temp_fecha_vuelta = None
+        elif _es_fecha_valida(texto):
+            usuario.temp_fecha_vuelta = texto.strip()
+        else:
+            return (
+                MSG_FORMATO_FECHA + "\n"
+                "O escribí *-* si no sabés la fecha de vuelta."
+            )
         db.commit()
         _set_estado(usuario, EstadoBot.PV_CONFIRMAR, db)
         return (
             f"🚛 *Resumen de tu viaje:*\n\n"
-            f"{usuario.temp_origen} → {usuario.temp_destino}\n"
-            f"Camión: {usuario.temp_tipo_camion}\n"
-            f"Fecha de salida: {usuario.temp_fecha_salida}\n"
-            f"Fecha de vuelta: {usuario.temp_fecha_vuelta or 'No especificada'}\n\n"
+            f"📍 {usuario.temp_origen} → {usuario.temp_destino}\n"
+            f"🚚 Camión: {usuario.temp_tipo_camion}\n"
+            f"📅 Salida: {usuario.temp_fecha_salida}\n"
+            f"📅 Vuelta: {usuario.temp_fecha_vuelta or 'No especificada'}\n\n"
             f"1️⃣ Confirmar\n"
             f"2️⃣ Cancelar"
         )
@@ -244,12 +327,7 @@ def _manejar_publicar_viaje(usuario: Usuario, texto: str, db: Session) -> str:
                 fecha_vuelta=usuario.temp_fecha_vuelta,
             )
             db.add(viaje)
-            # Limpiar datos temporales
-            usuario.temp_origen = None
-            usuario.temp_destino = None
-            usuario.temp_tipo_camion = None
-            usuario.temp_fecha_salida = None
-            usuario.temp_fecha_vuelta = None
+            _limpiar_temp(usuario, db)
             _set_estado(usuario, EstadoBot.MENU, db)
             return (
                 "✅ Tu viaje fue publicado con éxito\n"
@@ -257,6 +335,7 @@ def _manejar_publicar_viaje(usuario: Usuario, texto: str, db: Session) -> str:
                 f"{MSG_MENU}"
             )
         elif texto == "2":
+            _limpiar_temp(usuario, db)
             _set_estado(usuario, EstadoBot.MENU, db)
             return f"Publicación cancelada.\n\n{MSG_MENU}"
         else:
@@ -268,6 +347,22 @@ def _manejar_publicar_viaje(usuario: Usuario, texto: str, db: Session) -> str:
 # ──────────────────────────────────────────────
 # Helpers
 # ──────────────────────────────────────────────
+
+def _msg_pedir_fecha_salida() -> str:
+    return (
+        "¿Cuándo salís? 📅\n"
+        "Formato: *dd/mm* — Ejemplo: *15/06*"
+    )
+
+
+def _limpiar_temp(usuario: Usuario, db: Session):
+    usuario.temp_origen = None
+    usuario.temp_destino = None
+    usuario.temp_tipo_camion = None
+    usuario.temp_fecha_salida = None
+    usuario.temp_fecha_vuelta = None
+    db.commit()
+
 
 def _set_estado(usuario: Usuario, estado: str, db: Session):
     usuario.estado_bot = estado

@@ -1,16 +1,25 @@
 """
-Servicio de matching: busca cargas compatibles con el origen/destino del transportista.
-Por ahora usa búsqueda por texto (ILIKE). En fases futuras se puede mejorar con
-geocodificación y radio de distancia.
+Servicio de matching: busca cargas compatibles con el origen del transportista.
 """
 
 from sqlalchemy.orm import Session
 from app.models.models import Carga
 
 
-def buscar_cargas_compatibles(origen: str, destino: str, db: Session) -> list[Carga]:
+def buscar_todas_las_cargas(db: Session) -> list[Carga]:
+    """Devuelve todas las cargas activas, ordenadas por fecha de creación."""
+    return (
+        db.query(Carga)
+        .filter(Carga.activa == True)
+        .order_by(Carga.creada_en.desc())
+        .limit(10)
+        .all()
+    )
+
+
+def buscar_cargas_compatibles(origen: str, destino: str | None, db: Session) -> list[Carga]:
     """
-    Busca cargas activas que coincidan aproximadamente con origen y destino.
+    Busca cargas activas filtrando por origen (obligatorio) y destino (opcional).
     La búsqueda es case-insensitive y por substring.
     """
     query = db.query(Carga).filter(Carga.activa == True)
