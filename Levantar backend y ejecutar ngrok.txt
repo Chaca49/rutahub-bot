@@ -1,0 +1,18 @@
+# Terminal 1
+venv\Scripts\activate
+uvicorn app.main:app --reload
+
+# Terminal 2
+ngrok http 8000
+
+
+PARA LEVANTAR EL PROYECTO CUANDO NECESITO TRABAJAR EN ESTE NUEVAMENTE. 
+
+curl -X POST https://makeover-swimsuit-portion.ngrok-free.dev/webhook/whatsapp -H "Content-Type: application/x-www-form-urlencoded" -d "From=652132&Body=hola" 
+
+Respuesta del BOT.
+
+
+
+
+T4H3813TBRML9G95AKDECWYY ACCESO A TWILO.
